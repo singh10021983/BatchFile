@@ -1,0 +1,186 @@
+@Library('KOSi Pipeline Library@v4.4.3') _
+
+def config = [    
+	'visualStudio':[
+		'tools':[
+			'msbuild': 'C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Professional\\MSBuild\\Current\\Bin\\msbuild.exe'
+		]
+	],
+    'git':[
+	    'commits':''
+	],     
+    'symbols':'0',    
+    'vaultToken':'1',
+    'solution':'TestCodeMaster.sln',
+    'checkoutStageRetryLimit':'2',
+    'vault':[
+        'executable':'C:\\Program Files\\Vault\\vault.exe'
+    ],
+    'nugetserver':[
+        'vaultPathForCredentials':'kv/secret/team-sep/nuget-api-key'
+    ],
+    'emailext':[
+        'subject':'SEP SA CITS',
+        'body':"""<p></p>""",
+        'mailList':'',        // default mailList is provided by jenkins config file which is defined as part of the jenkins job configuration for this repo on jenkins
+        'buildUrl':''
+    ],
+    'jenkins':[
+        'tagBuilt':false,
+        'bugfixBuilt':false
+    ],
+]
+
+String formattedCommitMsgs(Map config){
+    def cwd = env.WORKSPACE
+    def retVal = """<p><ul>"""
+    String[] commitMsgs = config.git.commits.split("\n")
+    for(String msg in commitMsgs){
+         if(msg.contains(cwd)){
+            continue
+        }
+        if(msg.contains("Commits from")){
+            continue
+        }
+        else{
+            retVal = """${retVal}<li>${msg}</li>"""
+        }
+            
+    }
+    
+    retVal="""${retVal}</ul></p>"""
+    return retVal
+}
+
+String build(Map config){
+
+    config.emailext.buildUrl = env.BUILD_URL
+    def cwd = env.WORKSPACE
+    // Get committer email
+    def committer = bat(returnStdout: true, script:"git log -1 --pretty=format:%%ae").trim()
+    committer = committer.minus("${cwd}>git log -1 --pretty=format:%ae").trim()
+    echo committer
+    config.emailext.mailList = "${committer};${config.emailext.mailList}"
+    echo config.emailext.mailList
+    def commitDetails = bat(returnStdout: true, script: "git log -1").trim()
+    commitDetails = commitDetails.minus("${cwd}>git log -1").trim()
+    echo commitDetails
+    config.emailext.body = """<p>${commitDetails}</p>"""
+    // Actual command to build 
+    
+    def solutionPath = "\"${cwd}\\${config.solution}\""
+
+    status = bat(returnStdout: true, script: "\"${config.visualStudio.tools.msbuild}\" ${solutionPath} /restore /t:Clean,Build /m /v:m /p:Configuration=Debug /p:Platform=\"Any CPU\"")
+	echo status
+
+    
+}
+
+
+
+void sparseCheckout(Map config){
+    
+    echo 'Doing Sparse Checkout'
+    
+    status = bat(returnStdout: true, script: "git clone https://bitbucket.it.keysight.com/scm/sep/sa.git . --no-checkout")
+    echo status
+
+    status = bat (returnStdout: true, script: "git config core.SparseCheckout true")
+    echo status
+    
+    status = bat (returnStdout: true, script: "echo !InputFiles/* > ./.git/info/sparse-checkout")
+    echo status
+
+    status = bat (returnStdout: true, script: "echo /* >> ./.git/info/sparse-checkout")
+    echo status
+
+    status = bat(returnStdout: true, script: "git checkout develop")
+    echo status
+
+
+}
+
+
+pipeline
+{   
+    agent{
+        label "SEP"
+    }
+
+    options{
+        // Required to clean workspace before Build
+        skipDefaultCheckout(true)
+        timeout(time:5,unit:'HOURS')
+        disableConcurrentBuilds()
+    }
+
+    stages{
+        stage('Configuration'){
+            steps{
+
+                // Read the config file defined in Jenkins job to get the default mail list
+                configFileProvider([configFile(fileId:'mailList', variable: 'mailingList')]){
+                        script{
+                            def props = readProperties(file:env.mailingList)                            
+                            config.emailext.mailList = props
+                            config.emailext.mailList = config.emailext.mailList.devEmail                    
+                        }
+                    }
+
+                script{
+                    config = InsertLibraryConfiguration(config)
+                    config = InsertVaultTokenViaJava(config)
+                }
+            }
+        }
+
+        // Clean the workspace on build agent
+        stage('SparseCheckout'){
+            steps{
+                
+                CleanWorkspace(config)
+
+                retry(GetCheckoutStageRetryLimit(config)){
+                    sparseCheckout(config)
+                }
+            }
+        }
+
+        stage("BranchBuild"){
+            when{
+                expression{
+                    return (GetGitBranchName() == 'develop' )
+                }
+            }
+            steps{
+                script{
+                    build(config)
+                }
+            }
+        }
+    }
+
+    post{
+        success{
+            emailext(
+                    subject:"PASSED : ${config.emailext.subject}",
+                    body:"${config.emailext.body}\n Build Log ${config.emailext.buildUrl}",
+                    to:"${config.emailext.mailList}"
+                    )            
+             
+        }
+
+        failure{
+            emailext(
+                    subject:"FAILED : ${config.emailext.subject}",
+                    body:"${config.emailext.body}\n Build Log ${config.emailext.buildUrl}",
+                    to:"${config.emailext.mailList}"
+                )
+        }
+
+        always{
+            
+            FinalizeJobWithoutClean(config)
+        }
+    }
+}
